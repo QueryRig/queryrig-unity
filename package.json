@@ -1,0 +1,13 @@
+{
+  "name": "com.queryrig.sdk",
+  "version": "0.1.0",
+  "displayName": "QueryRig",
+  "description": "QueryRig game analytics SDK — batched, durable event tracking with a runtime on/off switch.",
+  "unity": "2021.3",
+  "license": "MIT",
+  "keywords": ["analytics", "telemetry", "events"],
+  "author": {
+    "name": "QueryRig",
+    "url": "https://github.com/prhym/queryrig"
+  }
+}
