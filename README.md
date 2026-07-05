@@ -21,16 +21,62 @@ engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
 
 ## Install
 
-Package Manager → *Add package from git URL…*:
+1. In Unity, open **Window → Package Manager**.
+2. Click the **+** button in the top-left of that window, choose
+   **Add package from git URL…**, and paste:
 
-```
-https://github.com/prhym/queryrig-unity.git
-```
+   ```
+   https://github.com/prhym/queryrig-unity.git
+   ```
+3. Click **Add** and wait for Unity to finish importing.
 
-(or add `"com.queryrig.sdk": "https://github.com/prhym/queryrig-unity.git"`
-to `Packages/manifest.json`.)
+(Equivalent, if you'd rather edit the file directly: add
+`"com.queryrig.sdk": "https://github.com/prhym/queryrig-unity.git"` to
+`Packages/manifest.json`.)
+
+The SDK self-initializes at startup — no scene objects, no prefabs to drag
+in, nothing further to configure here.
 
 ## Use
+
+Unity doesn't ship a visual-scripting system that maps cleanly onto this
+SDK's API, so tracking an event means writing one call in a C# script —
+everything else (batching, retries, sessions) happens automatically. The
+smallest way to add that call so it can be wired up from the Inspector
+afterward, with no further code:
+
+1. In the **Project** window, right-click → **Create → C# Script**, name it
+   e.g. `TrackLevelComplete`, and double-click to open it in your editor.
+2. Replace its contents with:
+
+   ```csharp
+   using UnityEngine;
+   using System.Collections.Generic;
+   using QueryRigSdk;
+
+   public class TrackLevelComplete : MonoBehaviour
+   {
+       public void Fire()
+       {
+           QueryRig.Track("level_complete", new Dictionary<string, object> {
+               { "level", 3 }, { "duration_s", 82.5 },
+           });
+       }
+   }
+   ```
+3. Save, drag the script onto any GameObject (a Button works well), then in
+   that Button's **On Click ()** list in the Inspector, click **+**, drag the
+   same GameObject in, and pick `TrackLevelComplete → Fire()` from the
+   function dropdown. Clicking the button now tracks the event — no more
+   code needed for that hookup.
+
+Everything inside `Fire()` is yours to edit — swap `"level_complete"` for any
+event name, and the dictionary for whatever details matter (or drop the
+dictionary entirely: `QueryRig.Track("item_pickup")`). Duplicate the script
+per event, or add more public methods to one script for a small set of
+related events.
+
+Called directly from your own code instead, it's simpler still:
 
 ```csharp
 using QueryRigSdk;
@@ -41,7 +87,6 @@ QueryRig.Track("level_complete", new Dictionary<string, object> {
 QueryRig.SetPlayerId(steamId); // optional; defaults to a stable device id
 ```
 
-The SDK self-initializes at startup — no scene objects, no prefabs.
 `session_id`, `player_id`, `platform`, `build_version`, `timestamp`, and
 `event_id` are stamped automatically (explicit properties win).
 `session_start` / `session_end` events are emitted for you, with a 30-minute
@@ -49,8 +94,14 @@ idle rollover.
 
 ## Configure
 
-Create `queryrig.json` — the key and endpoint come from the Keys tab of your
-QueryRig project:
+1. In the **Project** window, make sure a `StreamingAssets` folder exists
+   directly under `Assets` — if it doesn't, right-click `Assets` →
+   **Create → Folder**, name it `StreamingAssets`.
+2. Inside it, create a text file named `queryrig.json` (any text editor
+   works — Unity doesn't need to know about it as an asset type).
+3. Fill in `api_key` and `endpoint` — both are shown on the **Keys** tab of
+   your QueryRig project (the dashboard at your QueryRig site). Leave the
+   quotes in place; only change what's between them:
 
 ```json
 {
@@ -59,6 +110,9 @@ QueryRig project:
   "enabled": "remote"
 }
 ```
+
+This file works for testing in the Editor's Play mode too — no build
+required to try it.
 
 Resolution order: built-in defaults < `StreamingAssets/queryrig.json` <
 `queryrig.json` **next to the executable** (desktop builds) <
