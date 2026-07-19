@@ -89,27 +89,39 @@ namespace QueryRigSdk
             QueryRig.Track("level_complete", new Dictionary<string, object> { { "level", 3 }, { "duration_s", 82.5 } });
             QueryRig.Track("item_pickup", new Dictionary<string, object> { { "item", "sword" } });
             QueryRig.Track("enemy_killed", null);
+            // No event_name at all: nothing is reserved, so an event is any set
+            // of fields. Proves the server accepts the studio's own vocabulary.
+            QueryRig.TrackFields(new Dictionary<string, object> { { "kind", "boss_defeated" }, { "boss", "warden" } });
             QueryRig.Flush();
 
-            // 3 tracked + the automatic session_start.
-            Check(WaitUntil(() => HarnessRows() >= 4, 5.0), "delivery: 4 rows arrive after flush");
+            // 4 tracked + the automatic session_start.
+            Check(WaitUntil(() => HarnessRows() >= 5, 5.0), "delivery: 5 rows arrive after flush");
 
             var rows = ReqArray("/__harness/rows");
             var names = new HashSet<string>();
             var sessions = new HashSet<string>();
             var ids = new HashSet<string>();
             bool stamped = true;
-            Dictionary<string, object> levelRow = null;
+            Dictionary<string, object> levelProps = null;
+            Dictionary<string, object> unnamed = null;
             foreach (var row in rows.OfType<Dictionary<string, object>>())
             {
-                names.Add((string)row["event_name"]);
-                sessions.Add((string)row["session_id"]);
+                // Only timestamp/received_at/event_id (+ project_id) are
+                // columns; every other field lands in `properties` by name.
+                var p = (Dictionary<string, object>)row["properties"];
+                string name = p.TryGetValue("event_name", out object n) ? (string)n : null;
+                names.Add(name);
+                sessions.Add((string)p["session_id"]);
                 ids.Add((string)row["event_id"]);
-                stamped = stamped && !string.IsNullOrEmpty((string)row["player_id"])
-                    && !string.IsNullOrEmpty((string)row["platform"]);
-                if ((string)row["event_name"] == "level_complete")
+                stamped = stamped && !string.IsNullOrEmpty((string)p["player_id"])
+                    && !string.IsNullOrEmpty((string)p["platform"]);
+                if (name == "level_complete")
                 {
-                    levelRow = row;
+                    levelProps = p;
+                }
+                else if (name == null)
+                {
+                    unnamed = p;
                 }
             }
             Check(names.Contains("session_start") && names.Contains("level_complete"),
@@ -117,9 +129,14 @@ namespace QueryRigSdk
             Check(stamped, "stamping: player_id + platform set on every row");
             Check(sessions.Count == 1, "stamping: one session_id across the batch");
             Check(ids.Count == rows.Count, "stamping: event_ids unique");
-            var props = levelRow?["properties"] as Dictionary<string, object>;
-            Check(props != null && (double)props["level"] == 3.0 && (double)props["duration_s"] == 82.5,
-                "stamping: properties survive normalization");
+            Check(unnamed != null && (string)unnamed["kind"] == "boss_defeated"
+                && (string)unnamed["boss"] == "warden",
+                "fields: an event with no event_name is accepted and keeps its own fields");
+            // Every property scalar is stored as a string, whatever the client
+            // sent — one type per path, so equality in a query always works.
+            Check(levelProps != null && (string)levelProps["level"] == "3"
+                && (string)levelProps["duration_s"] == "82.5",
+                "stamping: property values arrive as strings");
 
             bool userAgent = ReqArray("/__harness/requests").OfType<Dictionary<string, object>>()
                 .Any(r => ((string)r["userAgent"]).Contains("queryrig-unity/"));

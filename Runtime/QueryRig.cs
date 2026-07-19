@@ -53,9 +53,18 @@ namespace QueryRigSdk
             _client = new QueryRigClient(overrides);
         }
 
-        /// <summary>Queue an event. Safe from any thread; never blocks on I/O.</summary>
+        /// <summary>Queue an event under a name. Safe from any thread; never blocks on I/O.
+        /// The name is sent as the <c>event_name</c> field, which the dashboard's query
+        /// templates look for by default — a convention, not a requirement.</summary>
         public static void Track(string eventName, Dictionary<string, object> properties = null)
             => _client?.Track(eventName, properties);
+
+        /// <summary>Queue an event with no name — the fields are entirely yours.
+        /// Nothing is reserved server-side: an event is any set of fields, and the only
+        /// rule is that it carries at least one. Use this when the game already has its
+        /// own vocabulary, and point the query templates at that field instead.</summary>
+        public static void TrackFields(Dictionary<string, object> fields)
+            => _client?.TrackFields(fields);
 
         /// <summary>Override the default (device-derived) player id.</summary>
         public static void SetPlayerId(string playerId) => _client?.SetPlayerId(playerId);
@@ -233,6 +242,15 @@ namespace QueryRigSdk
 
         public void Track(string eventName, Dictionary<string, object> properties)
         {
+            var fields = properties != null
+                ? new Dictionary<string, object>(properties)
+                : new Dictionary<string, object>();
+            fields["event_name"] = eventName;
+            TrackFields(fields);
+        }
+
+        public void TrackFields(Dictionary<string, object> fields)
+        {
             if (_inert || !IsCollecting() || !_sampledIn)
             {
                 return;
@@ -243,7 +261,7 @@ namespace QueryRigSdk
                 StartSession(); // 30-minute idle rollover (spec §3.5)
             }
             _lastEventMs = now;
-            Enqueue(Stamp(eventName, properties));
+            Enqueue(Stamp(fields));
         }
 
         public void SetPlayerId(string playerId) => _playerId = playerId;
@@ -378,7 +396,7 @@ namespace QueryRigSdk
             _sampledIn = (Fnv1a(_sessionId) & 0x7fffffff) % 10_000 < (int)(rate * 10_000);
             if (_sampledIn && IsCollecting())
             {
-                Enqueue(Stamp("session_start", null));
+                Enqueue(Stamp(new Dictionary<string, object> { { "event_name", "session_start" } }));
             }
         }
 
@@ -388,8 +406,9 @@ namespace QueryRigSdk
             {
                 return;
             }
-            Enqueue(Stamp("session_end", new Dictionary<string, object>
+            Enqueue(Stamp(new Dictionary<string, object>
             {
+                { "event_name", "session_end" },
                 { "duration_s", (NowMs() - _sessionStartMs) / 1000.0 },
             }));
         }
@@ -398,12 +417,16 @@ namespace QueryRigSdk
 
         // Stamp everything at enqueue time (spec §3.3) so retries can't change
         // the event. Explicit values in the properties win over SDK defaults.
-        private Dictionary<string, object> Stamp(string eventName, Dictionary<string, object> properties)
+        //
+        // Values go out as their natural JSON types; the server coerces every
+        // scalar to a string so each field has one predictable type to query.
+        // Never pre-stringify here — that would lose the distinction between
+        // "not sent" and "sent empty".
+        private Dictionary<string, object> Stamp(Dictionary<string, object> properties)
         {
             var ev = properties != null
                 ? new Dictionary<string, object>(properties)
                 : new Dictionary<string, object>();
-            ev["event_name"] = eventName;
             if (!ev.ContainsKey("event_id")) ev["event_id"] = NewUuid();
             if (!ev.ContainsKey("timestamp")) ev["timestamp"] = NowMs();
             if (!ev.ContainsKey("session_id")) ev["session_id"] = _sessionId;
