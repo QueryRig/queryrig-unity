@@ -16,12 +16,14 @@ namespace QueryRigSdk
         public static string Serialize(object value)
         {
             var sb = new StringBuilder(256);
-            Write(sb, value);
+            Write(sb, value, 0);
             return sb.ToString();
         }
 
-        private static void Write(StringBuilder sb, object value)
+        private static void Write(StringBuilder sb, object value, int depth)
         {
+            if (depth >= 8 && value is IEnumerable && !(value is string))
+                throw new FormatException("Event nesting exceeds 8 levels (or contains a cycle)");
             switch (value)
             {
                 case null:
@@ -34,9 +36,11 @@ namespace QueryRigSdk
                     WriteString(sb, s);
                     break;
                 case float f:
+                    if (float.IsNaN(f) || float.IsInfinity(f)) throw new FormatException("Non-finite event number");
                     sb.Append(f.ToString("R", CultureInfo.InvariantCulture));
                     break;
                 case double d:
+                    if (double.IsNaN(d) || double.IsInfinity(d)) throw new FormatException("Non-finite event number");
                     sb.Append(d.ToString("R", CultureInfo.InvariantCulture));
                     break;
                 case decimal m:
@@ -56,7 +60,7 @@ namespace QueryRigSdk
                         first = false;
                         WriteString(sb, Convert.ToString(entry.Key, CultureInfo.InvariantCulture));
                         sb.Append(':');
-                        Write(sb, entry.Value);
+                        Write(sb, entry.Value, depth + 1);
                     }
                     sb.Append('}');
                     break;
@@ -69,15 +73,13 @@ namespace QueryRigSdk
                     {
                         if (!first) sb.Append(',');
                         first = false;
-                        Write(sb, item);
+                        Write(sb, item, depth + 1);
                     }
                     sb.Append(']');
                     break;
                 }
                 default:
-                    // Unknown type: stringify rather than fail — analytics must not throw.
-                    WriteString(sb, value.ToString());
-                    break;
+                    throw new FormatException("Unsupported event property type; use JSON-compatible values");
             }
         }
 

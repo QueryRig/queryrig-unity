@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using UnityEngine;
@@ -32,10 +33,9 @@ namespace QueryRigSdk
     /// Design contract, in order:
     ///  1. Telemetry behavior is a runtime decision — config file, env var, or
     ///     the remote gate. Never a rebuild.
-    ///  2. Accepted events are never lost: memory queue -> disk spill -> replay,
-    ///     with client-generated event_ids so retries are dedupe-safe.
-    ///  3. Track() never costs a frame: it stamps and enqueues; serialization,
-    ///     disk, and HTTP run on a worker thread.
+    ///  2. Persist batches before sending; preserve identity for retries.
+    ///     Queue caps, crashes before persistence, and disk failures can lose events.
+    ///  3. Track() validates and serializes; disk and HTTP run on a worker thread.
     ///
     /// Usage: QueryRig.Track("level_complete", new Dictionary&lt;string, object&gt; {
     ///     { "level", 3 }, { "duration_s", 82.5 } });
@@ -78,7 +78,8 @@ namespace QueryRigSdk
         /// <summary>Effective telemetry state, for game-side debug UI.</summary>
         public static bool IsEnabled => _client != null && _client.IsEnabled;
 
-        /// <summary>Final flush with a short deadline, then stop the worker.</summary>
+        /// <summary>Cancel HTTP, join the worker, and attempt local persistence.
+        /// Disk operations can block or fail.</summary>
         public static void Shutdown()
         {
             _client?.Shutdown();
@@ -141,7 +142,8 @@ namespace QueryRigSdk
 
         // Memory queue (any-thread Track).
         private readonly object _queueLock = new object();
-        private List<Dictionary<string, object>> _queue = new List<Dictionary<string, object>>();
+        private List<string> _queue = new List<string>();
+        private readonly object _trackLock = new object();
         private int _droppedOverflow;
 
         // Worker thread + signaling.
@@ -149,7 +151,7 @@ namespace QueryRigSdk
         private readonly Thread _thread;
         private bool _flushRequested;
         private bool _gateRequested;
-        private bool _quitting;
+        private volatile bool _quitting;
         private bool _shutdownDone;
 
         // Delivery state (worker thread only).
@@ -195,7 +197,13 @@ namespace QueryRigSdk
             _sampleRate = GetNumber(cfg, "sample_rate", 1.0);
             _gatePollIntervalS = GetNumber(cfg, "gate_poll_interval_s", 300);
 
-            _dataDir = Path.Combine(Application.persistentDataPath, "queryrig");
+            // Include the key, not just the host: one ingest host serves many projects.
+            // Legacy unscoped queues are intentionally left untouched.
+            using (var hash = SHA256.Create())
+            {
+                string identity = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(_endpoint.TrimEnd('/') + "\n" + _apiKey))).Replace("-", "").ToLowerInvariant();
+                _dataDir = Path.Combine(Application.persistentDataPath, "queryrig", identity);
+            }
             _queueDir = Path.Combine(_dataDir, "queue");
             _platform = Application.platform.ToString().ToLowerInvariant();
             _buildVersion = Application.version ?? "";
@@ -251,20 +259,17 @@ namespace QueryRigSdk
 
         public void TrackFields(Dictionary<string, object> fields)
         {
-            if (_inert || !IsCollecting() || !_sampledIn)
+            lock (_trackLock)
             {
-                return;
+                if (_inert || _quitting || !IsCollecting()) return;
+                long now = NowMs();
+                if (_lastEventMs > 0 && now - _lastEventMs > SessionGapMs) StartSession();
+                _lastEventMs = now;
+                if (_sampledIn) Enqueue(Stamp(fields));
             }
-            long now = NowMs();
-            if (_lastEventMs > 0 && now - _lastEventMs > SessionGapMs)
-            {
-                StartSession(); // 30-minute idle rollover (spec §3.5)
-            }
-            _lastEventMs = now;
-            Enqueue(Stamp(fields));
         }
 
-        public void SetPlayerId(string playerId) => _playerId = playerId;
+        public void SetPlayerId(string playerId) { lock (_trackLock) _playerId = playerId; }
 
         public void Flush()
         {
@@ -281,7 +286,7 @@ namespace QueryRigSdk
 
         public void RefreshGate()
         {
-            if (_inert || _mode != EnabledMode.Remote)
+            if (_inert || _quitting)
             {
                 return;
             }
@@ -302,14 +307,18 @@ namespace QueryRigSdk
             }
             _shutdownDone = true;
             Application.focusChanged -= OnFocusChanged;
-            EndSession();
-            _httpTimeoutMs = 2_000; // shutdown deadline (spec §3.9)
+            lock (_trackLock) { EndSession(); _quitting = true; }
             lock (_signal)
             {
                 _quitting = true;
                 Monitor.Pulse(_signal);
             }
-            _thread.Join(5_000);
+            // The current request is cancellable; no new network work starts
+            // after quitting. Join persistence instead of abandoning a worker.
+            _http.CancelPendingRequests();
+            _thread.Join();
+            _http.Dispose();
+            lock (_queueLock) if (_queue.Count > 0) Debug.LogWarning("QueryRig: shutdown persistence failed; queued events remain memory-only");
         }
 
         // ---------------------------------------------------------- config
@@ -438,10 +447,18 @@ namespace QueryRigSdk
 
         private void Enqueue(Dictionary<string, object> ev)
         {
+            string line;
+            try
+            {
+                // Snapshot now, before the caller can change nested objects.
+                line = QueryRigJson.Serialize(ev);
+                if (Encoding.UTF8.GetByteCount(line) + 2 > FlushMaxBytes) throw new FormatException("Event exceeds payload budget");
+            }
+            catch (Exception e) { Debug.LogWarning("QueryRig: invalid event discarded: " + e.Message); return; }
             bool requestFlush;
             lock (_queueLock)
             {
-                _queue.Add(ev);
+                _queue.Add(line);
                 while (_queue.Count > MemoryQueueMax) // drop OLDEST on overflow
                 {
                     _queue.RemoveAt(0);
@@ -470,11 +487,7 @@ namespace QueryRigSdk
         private void WorkerLoop()
         {
             long nextFlushAt = NowMs() + (long)(_flushIntervalS * 1000);
-            long nextGateAt = long.MaxValue;
-            if (_mode == EnabledMode.Remote)
-            {
-                nextGateAt = NowMs() + (long)(_gatePollIntervalS * 1000);
-            }
+            long nextGateAt = NowMs() + (long)(Math.Max(1, _gatePollIntervalS) * 1000);
 
             while (true)
             {
@@ -492,84 +505,38 @@ namespace QueryRigSdk
                 }
 
                 long now = NowMs();
+                if (doQuit) { SpillQueueToDisk(); return; }
                 if (doGate || now >= nextGateAt)
                 {
-                    nextGateAt = now + (long)(_gatePollIntervalS * 1000);
-                    DoGateCheck();
+                    nextGateAt = now + (long)(Math.Max(1, _gatePollIntervalS) * 1000);
+                    if (_mode == EnabledMode.Remote || _dormant || doGate) DoGateCheck();
                 }
                 if (doFlush || doQuit || now >= nextFlushAt)
                 {
                     nextFlushAt = now + (long)(_flushIntervalS * 1000);
                     DoFlush();
                 }
-                if (doQuit)
-                {
-                    SpillQueueToDisk(); // whatever the final flush couldn't deliver
-                    return;
-                }
             }
         }
 
         private void DoFlush()
         {
-            if (_dormant)
-            {
-                return;
-            }
-            List<Dictionary<string, object>> events;
-            int dropped;
-            lock (_queueLock)
-            {
-                events = _queue;
-                _queue = new List<Dictionary<string, object>>();
-                dropped = _droppedOverflow;
-                _droppedOverflow = 0;
-            }
-            if (dropped > 0)
-            {
-                Debug.LogWarning($"QueryRig: memory queue overflowed; dropped {dropped} oldest events");
-            }
-            if (events.Count == 0)
-            {
-                DrainDiskOne();
-                return;
-            }
-
-            var lines = events.Select(e => QueryRigJson.Serialize(e)).ToList();
-            bool allOk = true;
-            foreach (var batch in SplitBatches(lines))
-            {
-                switch (SendBatch(batch))
-                {
-                    case SendOutcome.Delivered:
-                        break;
-                    case SendOutcome.Rejected:
-                        AppendRejected(batch);
-                        break;
-                    default: // Retryable or Dormant: spill; the drain loop owns retries
-                        SpillToDisk(batch);
-                        allOk = false;
-                        break;
-                }
-            }
-            if (allOk)
-            {
-                DrainDiskOne();
-            }
+            SpillQueueToDisk();
+            if (!_quitting) DrainDiskOne();
         }
 
         private static IEnumerable<List<string>> SplitBatches(List<string> lines)
         {
             var current = new List<string>();
-            int bytes = 0;
+            int bytes = 2; // JSON array brackets
             foreach (string line in lines)
             {
-                int n = Encoding.UTF8.GetByteCount(line);
+                int n = Encoding.UTF8.GetByteCount(line) + 1;
                 if (current.Count >= MaxBatchEvents || (bytes + n > FlushMaxBytes && current.Count > 0))
                 {
                     yield return current;
                     current = new List<string>();
-                    bytes = 0;
+                    bytes = 2;
                 }
                 current.Add(line);
                 bytes += n;
@@ -585,6 +552,7 @@ namespace QueryRigSdk
         // re-spilled into a duplicate file.
         private SendOutcome SendBatch(List<string> lines)
         {
+            if (_quitting || _dormant || NowMs() < _nextDrainMs) return SendOutcome.Retryable;
             string body = "[" + string.Join(",", lines) + "]";
             int code;
             string responseBody = "";
@@ -611,18 +579,20 @@ namespace QueryRigSdk
 
             if (code == 200)
             {
-                NoteSuccess();
                 try
                 {
-                    if (QueryRigJson.Parse(responseBody) is Dictionary<string, object> parsed
-                        && parsed.TryGetValue("rejected", out object rejected)
-                        && rejected is double r && r > 0)
+                    var parsed = QueryRigJson.Parse(responseBody) as Dictionary<string, object>;
+                    if (parsed == null || !parsed.TryGetValue("accepted", out object accepted) || !(accepted is double a)
+                        || !parsed.TryGetValue("rejected", out object rejected) || !(rejected is double r)
+                        || a < 0 || r < 0 || a + r != lines.Count) throw new FormatException("Invalid delivery acknowledgement");
+                    if (r > 0)
                     {
                         Debug.LogWarning($"QueryRig: server rejected {(int)r} event(s) — integration bug, see response results");
                     }
+                    NoteSuccess();
+                    return SendOutcome.Delivered;
                 }
-                catch { /* response diagnostics only */ }
-                return SendOutcome.Delivered;
+                catch { NoteFailure(); return SendOutcome.Retryable; }
             }
             if (code == 401)
             {
@@ -660,34 +630,48 @@ namespace QueryRigSdk
 
         private void SpillQueueToDisk()
         {
-            List<Dictionary<string, object>> remaining;
+            List<string> remaining;
             lock (_queueLock)
             {
                 remaining = _queue;
-                _queue = new List<Dictionary<string, object>>();
+                _queue = new List<string>();
+                if (_droppedOverflow > 0) Debug.LogWarning($"QueryRig: memory cap dropped {_droppedOverflow} oldest events");
+                _droppedOverflow = 0;
             }
             if (remaining.Count == 0)
             {
                 return;
             }
-            var lines = remaining.Select(e => QueryRigJson.Serialize(e)).ToList();
-            foreach (var batch in SplitBatches(lines))
+            foreach (var batch in SplitBatches(remaining))
             {
-                SpillToDisk(batch);
+                if (!SpillToDisk(batch))
+                {
+                    lock (_queueLock)
+                    {
+                        _queue.InsertRange(0, batch);
+                        int overflow = Math.Max(0, _queue.Count - MemoryQueueMax);
+                        if (overflow > 0) { _queue.RemoveRange(0, overflow); _droppedOverflow += overflow; }
+                    }
+                }
             }
         }
 
-        private void SpillToDisk(List<string> lines)
+        private bool SpillToDisk(List<string> lines)
         {
             try
             {
-                string path = Path.Combine(_queueDir, $"{NowMs()}_{_random.Next(1_000_000):D6}.ndjson");
-                File.WriteAllText(path, string.Join("\n", lines));
-                EnforceDiskCap();
+                string path = Path.Combine(_queueDir, $"{NowMs()}_{Guid.NewGuid():N}.ndjson");
+                byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", lines));
+                using (var file = new FileStream(path + ".tmp", FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                { file.Write(bytes, 0, bytes.Length); file.Flush(true); }
+                File.Move(path + ".tmp", path);
+                try { EnforceDiskCap(); } catch (Exception e) { Debug.LogWarning("QueryRig: queue cleanup failed: " + e.Message); }
+                return true;
             }
             catch (Exception e)
             {
-                Debug.LogWarning($"QueryRig: cannot write disk queue; {lines.Count} events lost: {e.Message}");
+                Debug.LogWarning($"QueryRig: cannot persist {lines.Count} events; keeping in memory: {e.Message}");
+                return false;
             }
         }
 
@@ -703,6 +687,7 @@ namespace QueryRigSdk
                 }
                 total -= new FileInfo(file).Length;
                 File.Delete(file);
+                Debug.LogWarning("QueryRig: disk cap evicted an oldest batch");
             }
         }
 
@@ -722,11 +707,12 @@ namespace QueryRigSdk
         // along unchanged.
         private void DrainDiskOne()
         {
-            if (_dormant || NowMs() < _nextDrainMs)
+            if (_quitting || _dormant || NowMs() < _nextDrainMs)
             {
                 return;
             }
-            var files = QueueFiles();
+            string[] files;
+            try { files = QueueFiles(); } catch (Exception e) { Debug.LogWarning("QueryRig: cannot list queue: " + e.Message); return; }
             if (files.Length == 0)
             {
                 return;
@@ -743,7 +729,7 @@ namespace QueryRigSdk
             }
             if (lines.Count == 0)
             {
-                File.Delete(path);
+                TryDelete(path);
                 return;
             }
             switch (SendBatch(lines))
@@ -752,11 +738,11 @@ namespace QueryRigSdk
                     // Delete only after success — a crash in between resends,
                     // and the server dedupes on event_id (same contract as the
                     // server's own R2 replay).
-                    File.Delete(path);
+                    TryDelete(path);
                     break;
                 case SendOutcome.Rejected:
                     AppendRejected(lines);
-                    File.Delete(path);
+                    TryDelete(path);
                     break;
                 default: // Retryable (backoff set) or Dormant: leave the file
                     break;
@@ -777,10 +763,17 @@ namespace QueryRigSdk
             catch { /* best-effort */ }
         }
 
+        private static void TryDelete(string path)
+        {
+            try { File.Delete(path); }
+            catch (Exception e) { Debug.LogWarning("QueryRig: acknowledged queue file retained: " + e.Message); }
+        }
+
         // ---------------------------------------------------------- remote gate
 
         private void DoGateCheck()
         {
+            if (_quitting) return;
             int code;
             string body;
             try

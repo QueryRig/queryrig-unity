@@ -1,2 +1,4 @@
 # Local telemetry config (ship per-environment copies, don't commit real keys)
 queryrig.json
+Tests~/bin/
+Tests~/obj/

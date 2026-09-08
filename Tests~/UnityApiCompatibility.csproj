@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <LangVersion>8.0</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Runtime/*.cs" />
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(UnityEditorPath)/Editor/Data/Managed/UnityEngine/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.Scripting" Condition="Exists('$(UnityEditorPath)/Editor/Data/Managed/UnityEngine/Unity.Scripting.dll')">
+      <HintPath>$(UnityEditorPath)/Editor/Data/Managed/UnityEngine/Unity.Scripting.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <Target Name="CheckUnityPath" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(UnityEditorPath)/Editor/Data/Managed/UnityEngine/UnityEngine.CoreModule.dll')" Text="Set -p:UnityEditorPath to an installed Unity editor version directory." />
+  </Target>
+</Project>
