@@ -60,6 +60,7 @@ namespace QueryRigSdk
             }
 
             TestDeliveryAndStamping();
+            TestSlowFallback();
             TestOutageNoLoss();
             TestRemoteKillSwitch();
             TestHardOffIsSilent();
@@ -141,6 +142,22 @@ namespace QueryRigSdk
             bool userAgent = ReqArray("/__harness/requests").OfType<Dictionary<string, object>>()
                 .Any(r => ((string)r["userAgent"]).Contains("queryrig-unity/"));
             Check(userAgent, "wire: User-Agent identifies the SDK");
+        }
+
+        private static void TestSlowFallback()
+        {
+            Thread.Sleep(200);
+            int before = HarnessRows(), requestsBefore = EventsRequestCount();
+            Req("POST", "/__harness/mode", "{\"events\":\"slow-fallback\"}");
+            QueryRig.Track("slow_fallback", null);
+            QueryRig.Flush();
+            Check(WaitUntil(() => HarnessRows() >= before + 1, 22.0),
+                "fallback: a 16-second R2 acknowledgement arrives");
+            Thread.Sleep(300);
+            QueryRig.Flush();
+            Thread.Sleep(500);
+            Check(EventsRequestCount() == requestsBefore + 1, "fallback: exactly one POST, no premature retry");
+            Req("POST", "/__harness/mode", "{\"events\":\"ok\"}");
         }
 
         private static void TestOutageNoLoss()

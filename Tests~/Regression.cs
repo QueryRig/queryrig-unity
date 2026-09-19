@@ -29,7 +29,7 @@ class Regression {
  static void Set(object c, string field, object value) => c.GetType().GetField(field, Flags).SetValue(c, value);
  static object Get(object c, string field) => c.GetType().GetField(field, Flags).GetValue(c);
  static void Check(bool condition, string name) { if (!condition) throw new Exception(name); Console.WriteLine("PASS " + name); }
- static void Wait(Func<bool> predicate) { if (!SpinWait.SpinUntil(predicate, 6000)) throw new Exception("Timed out"); }
+ static void Wait(Func<bool> predicate, int timeoutMs = 6000) { if (!SpinWait.SpinUntil(predicate, timeoutMs)) throw new Exception("Timed out"); }
  static void Invalid(object value) { try { QueryRigJson.Serialize(value); } catch (FormatException) { return; } throw new Exception("Invalid value serialized"); }
  static void Main() {
   string root = Path.Combine(Path.GetTempPath(), "queryrig-regression-" + Guid.NewGuid().ToString("N"));
@@ -79,6 +79,32 @@ class Regression {
   var a = new QueryRigClient(Settings("namespace-a")); string pathA=(string)Get(a,"_queueDir"); a.Shutdown();
   var b = new QueryRigClient(Settings("namespace-b")); string pathB=(string)Get(b,"_queueDir"); b.Shutdown();
   Check(pathA!=pathB && Directory.GetFiles(pathA,"*.ndjson").Length>0,"key change preserves but isolates the old queue");
+  // Actual production HTTP path: a response after the server's 15s CH deadline
+  // must be consumed once, remove the durable batch, and never enter backoff.
+  server.Malformed=false; server.DelayMs=16_000;
+  var slow = new QueryRigClient(Settings("slow-fallback"));
+  try {
+   slow.Track("slow-fallback",null); int prior=server.Events; slow.Flush();
+   string dir=(string)Get(slow,"_queueDir");
+   Wait(()=>server.Events>prior);
+   Wait(()=>Directory.GetFiles(dir,"*.ndjson").Length==0, 22_000);
+   Check((int)Get(slow,"_consecutiveFailures")==0, "16s fallback acknowledgement succeeds without backoff");
+   slow.Flush(); Thread.Sleep(300);
+   Check(server.Events==prior+1, "slow fallback uses one POST and removes the acknowledged batch");
+  } finally { slow.Shutdown(); server.DelayMs=0; }
+  server.Stall=true;
+  var timed = new QueryRigClient(Settings("timeout"));
+  try {
+   timed.Track("timeout",null); int prior=server.Events;
+   var elapsed=System.Diagnostics.Stopwatch.StartNew(); timed.Flush(); Wait(()=>server.Events>prior);
+   string dir=(string)Get(timed,"_queueDir");
+   string file=Directory.GetFiles(dir,"*.ndjson").Single(), original=File.ReadAllText(file);
+   Wait(()=>(long)Get(timed,"_nextDrainMs")>0, 35_000);
+   Check(elapsed.ElapsedMilliseconds>=25_000 && elapsed.ElapsedMilliseconds<35_000,
+    "hung upload stops at the 30s deadline and enters backoff");
+   Check(File.ReadAllText(file)==original && server.Events==prior+1,
+    "timeout retains the same event IDs and timestamps without a concurrent retry");
+  } finally { timed.Shutdown(); server.Stall=false; }
   var pending = new QueryRigClient(Settings("shutdown"));
   server.Malformed=false; server.Stall=true;
   pending.Track("shutdown-in-flight",null); int before=server.Events; pending.Flush(); Wait(()=>server.Events>before);
@@ -87,7 +113,7 @@ class Regression {
  }
  sealed class Server : IDisposable {
   readonly HttpListener listener=new HttpListener(); public readonly string Url;
-  public volatile int Status=200, Events; public volatile bool Malformed, Stall;
+  public volatile int Status=200, Events, DelayMs; public volatile bool Malformed, Stall;
   public Server() {
    var socket=new TcpListener(IPAddress.Loopback,0); socket.Start(); int port=((IPEndPoint)socket.LocalEndpoint).Port; socket.Stop();
    Url="http://127.0.0.1:"+port; listener.Prefixes.Add(Url+"/"); listener.Start(); _=Loop();
@@ -99,9 +125,10 @@ class Regression {
     if(c.Request.Url.AbsolutePath=="/v1/config") response="{\"enabled\":true}";
     else {
      string body=await new StreamReader(c.Request.InputStream).ReadToEndAsync(); Interlocked.Increment(ref Events);
-     if(Stall) { await Task.Delay(7000); c.Response.Close(); return; }
+     if(Stall) { await Task.Delay(45_000); c.Response.Close(); return; }
+     if(DelayMs>0) await Task.Delay(DelayMs);
      c.Response.StatusCode=Status; int n=((List<object>)QueryRigJson.Parse(body)).Count;
-     response=Malformed ? "not-json" : "{\"accepted\":"+n+",\"rejected\":0}";
+     response=Malformed ? "not-json" : "{\"accepted\":"+n+",\"rejected\":0,\"delivery\":\"r2_fallback\"}";
     }
     byte[] bytes=Encoding.UTF8.GetBytes(response); c.Response.ContentLength64=bytes.Length; await c.Response.OutputStream.WriteAsync(bytes); c.Response.Close();
    } catch(Exception) { /* shutdown can cancel requests */ }

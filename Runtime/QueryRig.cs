@@ -158,7 +158,9 @@ namespace QueryRigSdk
         private int _consecutiveFailures;
         private long _nextDrainMs;
         private readonly HttpClient _http;
-        private volatile int _httpTimeoutMs = 5_000;
+        // Outlast the Worker's 15s ClickHouse timeout plus R2 fallback.
+        private const int EventHttpTimeoutMs = 30_000;
+        private const int ConfigHttpTimeoutMs = 5_000;
 
         public QueryRigClient(QueryRigSettings overrides)
         {
@@ -558,7 +560,7 @@ namespace QueryRigSdk
             string responseBody = "";
             try
             {
-                using (var cts = new CancellationTokenSource(_httpTimeoutMs))
+                using (var cts = new CancellationTokenSource(EventHttpTimeoutMs))
                 using (var request = new HttpRequestMessage(HttpMethod.Post, _endpoint))
                 {
                     request.Content = new StringContent(body, Encoding.UTF8, "application/json");
@@ -778,7 +780,7 @@ namespace QueryRigSdk
             string body;
             try
             {
-                using (var cts = new CancellationTokenSource(_httpTimeoutMs))
+                using (var cts = new CancellationTokenSource(ConfigHttpTimeoutMs))
                 using (var request = new HttpRequestMessage(HttpMethod.Get, Origin(_endpoint) + "/v1/config"))
                 {
                     request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);

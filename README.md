@@ -158,6 +158,13 @@ funnels stay coherent).
 
 ## Delivery limits and upgrading
 
+Event uploads allow 30 seconds for a complete acknowledgement, leaving room
+for the server's 15-second ClickHouse timeout and R2 fallback. Config checks
+still time out after 5 seconds. A successful R2 acknowledgement completes the
+batch; a timeout retains it for backoff/retry with the same IDs and timestamps.
+Shutdown cancels outstanding uploads instead of waiting for the deadline.
+This does not guarantee a response within 30 seconds on every network.
+
 `Track`, `TrackFields`, and `SetPlayerId` are thread-safe after initialization.
 Initialize and shut down on Unity's main thread, without concurrent lifecycle
 calls. Do not mutate input collections during a tracking call; changes after
