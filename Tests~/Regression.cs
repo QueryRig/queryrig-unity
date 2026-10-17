@@ -21,7 +21,11 @@ namespace UnityEngine {
   public static void FireEvents() { quitting?.Invoke(); focusChanged?.Invoke(true); }
  }
  public static class SystemInfo { public static string deviceUniqueIdentifier="test", unsupportedIdentifier="unsupported"; }
- public static class Debug { public static void LogWarning(object message) { Console.WriteLine(message); } public static void LogError(object message) { Console.WriteLine(message); } }
+ public static class Debug {
+  public static int RefusedKeyWarnings;
+  public static void LogWarning(object message) { if (message.ToString().Contains("(HTTP 401)")) Interlocked.Increment(ref RefusedKeyWarnings); Console.WriteLine(message); }
+  public static void LogError(object message) { Console.WriteLine(message); }
+ }
 }
 
 class Regression {
@@ -86,9 +90,14 @@ class Regression {
    for(int i=0;i<4;i++) { client.Track("new-during-outage",null); client.Flush(); Thread.Sleep(100); }
    Check(server.Events==requests, "new events respect outage backoff");
    Check(Directory.GetFiles((string)Get(client,"_queueDir"),"*.ndjson").Length>0, "unacknowledged batches persist before send");
-   Set(client,"_nextDrainMs",0L); server.Status=401; client.Flush(); Wait(()=>!client.IsEnabled);
-   server.Status=200; client.RefreshGate(); Wait(()=>client.IsEnabled);
+   Set(client,"_nextDrainMs",0L); server.Status=401; server.ConfigStatus=401; client.Flush(); Wait(()=>!client.IsEnabled);
+   int configs=server.Configs; Wait(()=>server.Configs>=configs+2);
+   Check(UnityEngine.Debug.RefusedKeyWarnings==1 && !client.IsEnabled, "a refused key warns once across retries and gate polls");
+   server.Status=200; server.ConfigStatus=200; client.RefreshGate(); Wait(()=>client.IsEnabled);
    Check(true,"hard-on recovers from temporary 401");
+   Set(client,"_nextDrainMs",0L); server.Status=401; client.Track("refused-again",null); client.Flush(); Wait(()=>UnityEngine.Debug.RefusedKeyWarnings==2);
+   server.Status=200; client.RefreshGate(); Wait(()=>client.IsEnabled);
+   Check(true,"a 401 after recovery warns again");
    server.Malformed=true; Set(client,"_nextDrainMs",0L); client.Flush(); Wait(()=>(long)Get(client,"_nextDrainMs")>0);
    Check(Directory.GetFiles((string)Get(client,"_queueDir"),"*.ndjson").Length>0,"invalid 200 acknowledgement retains batch");
   } finally { client.Shutdown(); }
@@ -137,7 +146,7 @@ class Regression {
  }
  sealed class Server : IDisposable {
   readonly HttpListener listener=new HttpListener(); public readonly string Url;
-  public volatile int Status=200, Events, DelayMs; public volatile bool Malformed, Stall;
+  public volatile int Status=200, ConfigStatus=200, Events, Configs, DelayMs; public volatile bool Malformed, Stall;
   public Server() {
    var socket=new TcpListener(IPAddress.Loopback,0); socket.Start(); int port=((IPEndPoint)socket.LocalEndpoint).Port; socket.Stop();
    Url="http://127.0.0.1:"+port; listener.Prefixes.Add(Url+"/"); listener.Start(); _=Loop();
@@ -146,7 +155,7 @@ class Regression {
   async Task Handle(HttpListenerContext c) {
    try {
     string response;
-    if(c.Request.Url.AbsolutePath=="/v1/config") response="{\"enabled\":true}";
+    if(c.Request.Url.AbsolutePath=="/v1/config") { Interlocked.Increment(ref Configs); c.Response.StatusCode=ConfigStatus; response="{\"enabled\":true}"; }
     else {
      string body=await new StreamReader(c.Request.InputStream).ReadToEndAsync(); Interlocked.Increment(ref Events);
      if(Stall) { await Task.Delay(45_000); c.Response.Close(); return; }

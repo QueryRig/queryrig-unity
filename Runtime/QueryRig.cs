@@ -126,6 +126,9 @@ namespace QueryRigSdk
 
         private readonly bool _inert = true; // hard-off or no api_key: zero network
         private volatile bool _dormant;      // 401 or gate-off: drop new events, keep disk queue
+        // Set by the first 401 and cleared once the key is accepted again, so a
+        // refused key is reported once per dormant spell, not on every gate poll.
+        private volatile bool _keyRefused;
         // 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint no
         // retry can fix. Delivery stops until restart; queued batches are kept.
         private volatile bool _edgeBlocked;
@@ -635,6 +638,7 @@ namespace QueryRigSdk
                 // Key unknown/disabled: go dormant, keep events on disk, let
                 // the gate poll decide when to wake up (spec §1 responses).
                 _dormant = true;
+                NoteKeyRefused(_endpoint);
                 return SendOutcome.Dormant;
             }
             if (code == 403)
@@ -662,6 +666,16 @@ namespace QueryRigSdk
         {
             _consecutiveFailures = 0;
             _nextDrainMs = 0;
+            _keyRefused = false;
+        }
+
+        // Warns on the first 401 of a dormant spell. Uploads and gate checks
+        // both run on the worker thread, so the flag needs no lock.
+        private void NoteKeyRefused(string url)
+        {
+            if (_keyRefused) return;
+            _keyRefused = true;
+            Debug.LogWarning($"QueryRig: {url} refused the ingest key (HTTP 401). It may be disabled, rotated, or from another project; check the Keys tab. Events stay queued and sending resumes when the key is enabled.");
         }
 
         private void NoteFailure()
@@ -822,12 +836,13 @@ namespace QueryRigSdk
         private void DoGateCheck()
         {
             if (_quitting || _edgeBlocked) return;
+            string configUrl = Origin(_endpoint) + "/v1/config";
             int code;
             string body;
             try
             {
                 using (var cts = new CancellationTokenSource(ConfigHttpTimeoutMs))
-                using (var request = new HttpRequestMessage(HttpMethod.Get, Origin(_endpoint) + "/v1/config"))
+                using (var request = new HttpRequestMessage(HttpMethod.Get, configUrl))
                 {
                     request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
                     request.Headers.TryAddWithoutValidation("User-Agent", "queryrig-unity/" + SdkVersion);
@@ -866,12 +881,14 @@ namespace QueryRigSdk
             else if (code == 401)
             {
                 enabled = false;
+                NoteKeyRefused(configUrl);
             }
             else
             {
                 return;
             }
             SaveCachedGate(enabled);
+            if (enabled) _keyRefused = false;
             _dormant = !enabled;
         }
 
