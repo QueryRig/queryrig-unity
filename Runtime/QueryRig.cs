@@ -100,7 +100,7 @@ namespace QueryRigSdk
 
     internal sealed class QueryRigClient
     {
-        private const string SdkVersion = "0.2.0";
+        private const string SdkVersion = "0.2.1";
 
         // Spec limits (server-enforced; batches are built to stay inside them).
         private const int MaxBatchEvents = 500;
