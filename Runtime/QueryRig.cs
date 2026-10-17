@@ -100,7 +100,7 @@ namespace QueryRigSdk
 
     internal sealed class QueryRigClient
     {
-        private const string SdkVersion = "0.1.0";
+        private const string SdkVersion = "0.2.0";
 
         // Spec limits (server-enforced; batches are built to stay inside them).
         private const int MaxBatchEvents = 500;
@@ -126,6 +126,9 @@ namespace QueryRigSdk
 
         private readonly bool _inert = true; // hard-off or no api_key: zero network
         private volatile bool _dormant;      // 401 or gate-off: drop new events, keep disk queue
+        // 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint no
+        // retry can fix. Delivery stops until restart; queued batches are kept.
+        private volatile bool _edgeBlocked;
 
         // Captured on the main thread at Init — Unity APIs are main-thread-only.
         private readonly string _dataDir;
@@ -199,8 +202,8 @@ namespace QueryRigSdk
             _sampleRate = GetNumber(cfg, "sample_rate", 1.0);
             _gatePollIntervalS = GetNumber(cfg, "gate_poll_interval_s", 300);
 
-            // Include the key, not just the host: one ingest host serves many projects.
-            // Legacy unscoped queues are intentionally left untouched.
+            // Namespace by endpoint and key, so a key rotation (same endpoint) still
+            // isolates the old queue. Legacy unscoped queues are left untouched.
             using (var hash = SHA256.Create())
             {
                 string identity = BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(_endpoint.TrimEnd('/') + "\n" + _apiKey))).Replace("-", "").ToLowerInvariant();
@@ -214,6 +217,16 @@ namespace QueryRigSdk
             {
                 // Hard-off (or unconfigured): zero network calls, verifiable
                 // with a packet capture. Track() drops immediately.
+                _inert = true;
+                return;
+            }
+            // A key needs its own project's endpoint, over HTTPS (spec §2.2).
+            // Without one the SDK is just as inert, so a bad config never spins
+            // on retries.
+            string problem = EndpointProblem(_endpoint);
+            if (problem != null)
+            {
+                Debug.LogError($"QueryRig: {problem}; telemetry is off for this run");
                 _inert = true;
                 return;
             }
@@ -299,7 +312,7 @@ namespace QueryRigSdk
             }
         }
 
-        public bool IsEnabled => !_inert && !_dormant;
+        public bool IsEnabled => !_inert && !_dormant && !_edgeBlocked;
 
         public void Shutdown()
         {
@@ -372,6 +385,27 @@ namespace QueryRigSdk
             {
                 cfg[key] = arg.Substring(prefix.Length);
             }
+        }
+
+        /// <summary>Why <paramref name="url"/> cannot be an ingest endpoint, or null if
+        /// it can: HTTPS to any host, or plain HTTP to a loopback address for local
+        /// development.</summary>
+        internal static string EndpointProblem(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return "no endpoint configured (copy it from the project's Keys tab)";
+            }
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri) || string.IsNullOrEmpty(uri.Host)
+                || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+            {
+                return $"endpoint {url} is not a URL";
+            }
+            if (uri.Scheme == Uri.UriSchemeHttp && !uri.IsLoopback)
+            {
+                return $"endpoint {url} must use https://";
+            }
+            return null;
         }
 
         private static EnabledMode ParseEnabled(object value)
@@ -554,7 +588,7 @@ namespace QueryRigSdk
         // re-spilled into a duplicate file.
         private SendOutcome SendBatch(List<string> lines)
         {
-            if (_quitting || _dormant || NowMs() < _nextDrainMs) return SendOutcome.Retryable;
+            if (_quitting || _dormant || _edgeBlocked || NowMs() < _nextDrainMs) return SendOutcome.Retryable;
             string body = "[" + string.Join(",", lines) + "]";
             int code;
             string responseBody = "";
@@ -576,7 +610,7 @@ namespace QueryRigSdk
             catch
             {
                 NoteFailure();
-                return SendOutcome.Retryable; // network error or timeout
+                return SendOutcome.Retryable; // network error (an unresolvable, DNS-blocked host included) or timeout
             }
 
             if (code == 200)
@@ -601,6 +635,18 @@ namespace QueryRigSdk
                 // Key unknown/disabled: go dormant, keep events on disk, let
                 // the gate poll decide when to wake up (spec §1 responses).
                 _dormant = true;
+                return SendOutcome.Dormant;
+            }
+            if (code == 403)
+            {
+                // The edge refused the request before QueryRig saw it (spec §1):
+                // plain HTTP or a path outside the ingest API. Resending cannot
+                // succeed, and the events are valid, so keep them and stop.
+                if (!_edgeBlocked)
+                {
+                    _edgeBlocked = true;
+                    Debug.LogError($"QueryRig: {_endpoint} refused the upload at the edge (HTTP 403). Check the endpoint on the project's Keys tab; queued events are kept and delivery is stopped until restart.");
+                }
                 return SendOutcome.Dormant;
             }
             if (code == 400 || code == 413)
@@ -709,7 +755,7 @@ namespace QueryRigSdk
         // along unchanged.
         private void DrainDiskOne()
         {
-            if (_quitting || _dormant || NowMs() < _nextDrainMs)
+            if (_quitting || _dormant || _edgeBlocked || NowMs() < _nextDrainMs)
             {
                 return;
             }
@@ -775,7 +821,7 @@ namespace QueryRigSdk
 
         private void DoGateCheck()
         {
-            if (_quitting) return;
+            if (_quitting || _edgeBlocked) return;
             int code;
             string body;
             try
@@ -794,8 +840,9 @@ namespace QueryRigSdk
             }
             catch
             {
-                // Fetch failure: keep the cached answer (spec §3.2) — losing
-                // data over a flaky config fetch is worse than sending.
+                // Fetch failure (offline, unresolvable host, timeout): keep the
+                // cached answer (spec §3.2) — losing data over a flaky config
+                // fetch is worse than sending. Other statuses below do the same.
                 return;
             }
 
@@ -867,29 +914,44 @@ namespace QueryRigSdk
 
         // ---------------------------------------------------------- utils
 
+        // The default player id is pseudonymous: a hash of the device id scoped to
+        // the project's ingest host, so the raw hardware id never leaves the device
+        // and two games on one machine cannot be linked by it. The host (not the
+        // key) is the scope, so rotating the key keeps every player's id.
         private string DefaultPlayerId()
         {
-            string id = SystemInfo.deviceUniqueIdentifier;
-            if (!string.IsNullOrEmpty(id) && id != SystemInfo.unsupportedIdentifier)
+            string raw = SystemInfo.deviceUniqueIdentifier;
+            if (string.IsNullOrEmpty(raw) || raw == SystemInfo.unsupportedIdentifier)
             {
-                return id;
-            }
-            // Some platforms don't support device ids: persist a random one.
-            try
-            {
-                string path = Path.Combine(_dataDir, "device_id");
-                if (File.Exists(path))
+                // Some platforms don't support device ids: persist a random one,
+                // outside the endpoint/key namespace so a key rotation keeps it.
+                try
                 {
-                    return File.ReadAllText(path).Trim();
+                    string dir = Path.Combine(Application.persistentDataPath, "queryrig");
+                    string path = Path.Combine(dir, "device_id");
+                    raw = File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+                    if (raw.Length == 0)
+                    {
+                        raw = NewUuid();
+                        Directory.CreateDirectory(dir);
+                        File.WriteAllText(path, raw);
+                    }
                 }
-                id = NewUuid();
-                Directory.CreateDirectory(_dataDir);
-                File.WriteAllText(path, id);
-                return id;
+                catch
+                {
+                    raw = NewUuid();
+                }
             }
-            catch
+            return PseudonymousPlayerId(raw, _endpoint);
+        }
+
+        internal static string PseudonymousPlayerId(string raw, string endpoint)
+        {
+            string host = Uri.TryCreate(endpoint, UriKind.Absolute, out Uri uri) ? uri.Host.ToLowerInvariant() : "";
+            using (var sha = SHA256.Create())
             {
-                return NewUuid();
+                byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes("queryrig-player\n" + host + "\n" + raw));
+                return BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant().Substring(0, 32);
             }
         }
 

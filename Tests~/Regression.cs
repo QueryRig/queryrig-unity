@@ -21,7 +21,7 @@ namespace UnityEngine {
   public static void FireEvents() { quitting?.Invoke(); focusChanged?.Invoke(true); }
  }
  public static class SystemInfo { public static string deviceUniqueIdentifier="test", unsupportedIdentifier="unsupported"; }
- public static class Debug { public static void LogWarning(object message) { Console.WriteLine(message); } }
+ public static class Debug { public static void LogWarning(object message) { Console.WriteLine(message); } public static void LogError(object message) { Console.WriteLine(message); } }
 }
 
 class Regression {
@@ -49,7 +49,23 @@ class Regression {
   QueryRigJson.Serialize(depth);
   current["child"]=new Dictionary<string,object>(); Invalid(depth);
   Check(true,"eight container levels accepted; ninth empty container rejected");
+  Check(QueryRigClient.EndpointProblem("https://3fa91c0e.qrig.net/v1/events")==null
+   && QueryRigClient.EndpointProblem("http://127.0.0.1:8788/v1/events")==null
+   && QueryRigClient.EndpointProblem("http://localhost:8788/v1/events")==null, "https and loopback http endpoints accepted");
+  Check(QueryRigClient.EndpointProblem("")!=null && QueryRigClient.EndpointProblem("http://3fa91c0e.qrig.net/v1/events")!=null
+   && QueryRigClient.EndpointProblem("3fa91c0e.qrig.net/v1/events")!=null, "missing, plain-http and scheme-less endpoints refused");
+  string pid=QueryRigClient.PseudonymousPlayerId("device-1","https://3fa91c0e.qrig.net/v1/events");
+  Check(pid.Length==32 && pid==QueryRigClient.PseudonymousPlayerId("device-1","https://3FA91C0E.qrig.net/v1/events")
+   && pid!=QueryRigClient.PseudonymousPlayerId("device-1","https://0b7e44d2.qrig.net/v1/events") && !pid.Contains("device"),
+   "player id hash is stable per project host and hides the device id");
   using var server = new Server();
+  foreach (string bad in new[]{"", "http://ingest.example.com/v1/events", "ingest.example.com/v1/events"}) {
+   int prior=server.Events;
+   var inert = new QueryRigClient(new QueryRigSettings { ApiKey="bad-endpoint", Endpoint=bad, Enabled=true });
+   inert.Track("never-sent",null); inert.Flush(); Thread.Sleep(200);
+   Check((bool)Get(inert,"_inert") && !inert.IsEnabled && server.Events==prior, "inert with endpoint '"+bad+"'");
+   inert.Shutdown();
+  }
   QueryRigSettings Settings(string key="first") => new QueryRigSettings { ApiKey=key, Endpoint=server.Url+"/v1/events", Enabled=true, FlushIntervalS=9999, FlushMaxEvents=9999, GatePollIntervalS=1 };
   var client = new QueryRigClient(Settings());
   try {
@@ -79,6 +95,14 @@ class Regression {
   var a = new QueryRigClient(Settings("namespace-a")); string pathA=(string)Get(a,"_queueDir"); a.Shutdown();
   var b = new QueryRigClient(Settings("namespace-b")); string pathB=(string)Get(b,"_queueDir"); b.Shutdown();
   Check(pathA!=pathB && Directory.GetFiles(pathA,"*.ndjson").Length>0,"key change preserves but isolates the old queue");
+  var edge = new QueryRigClient(Settings("edge"));
+  try {
+   server.Status=403; edge.Track("edge-refused",null); int prior=server.Events; edge.Flush();
+   Wait(()=>server.Events>prior); Wait(()=>!edge.IsEnabled);
+   Set(edge,"_nextDrainMs",0L); edge.Flush(); Thread.Sleep(300);
+   Check(server.Events==prior+1 && (int)Get(edge,"_consecutiveFailures")==0
+    && Directory.GetFiles((string)Get(edge,"_queueDir"),"*.ndjson").Length>0, "edge 403 stops delivery without retrying and keeps the batch");
+  } finally { edge.Shutdown(); server.Status=200; }
   // Actual production HTTP path: a response after the server's 15s CH deadline
   // must be consumed once, remove the durable batch, and never enter backoff.
   server.Malformed=false; server.DelayMs=16_000;

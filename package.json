@@ -1,6 +1,6 @@
 {
   "name": "com.queryrig.sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "displayName": "QueryRig",
   "description": "QueryRig game analytics SDK — batched, durable event tracking with a runtime on/off switch.",
   "unity": "2021.3",

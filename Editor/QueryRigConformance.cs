@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using UnityEditor;
@@ -62,8 +63,12 @@ namespace QueryRigSdk
             TestDeliveryAndStamping();
             TestSlowFallback();
             TestOutageNoLoss();
+            TestEdgeForbiddenIsPermanent();
+            TestUnresolvableHostBacksOff();
             TestRemoteKillSwitch();
             TestHardOffIsSilent();
+            TestBadEndpointIsInert();
+            TestBlockedHostColdStart();
 
             QueryRig.Shutdown();
             if (_failures == 0)
@@ -128,6 +133,10 @@ namespace QueryRigSdk
             Check(names.Contains("session_start") && names.Contains("level_complete"),
                 "delivery: session_start + tracked events present");
             Check(stamped, "stamping: player_id + platform set on every row");
+            string player = rows.OfType<Dictionary<string, object>>()
+                .Select(r => (string)((Dictionary<string, object>)r["properties"])["player_id"]).FirstOrDefault() ?? "";
+            Check(player.Length == 32 && player != SystemInfo.deviceUniqueIdentifier,
+                "stamping: default player_id is a hash, not the raw device id");
             Check(sessions.Count == 1, "stamping: one session_id across the batch");
             Check(ids.Count == rows.Count, "stamping: event_ids unique");
             Check(unnamed != null && (string)unnamed["kind"] == "boss_defeated"
@@ -181,6 +190,64 @@ namespace QueryRigSdk
                 "outage: replay produced no duplicates");
         }
 
+        private static void TestEdgeForbiddenIsPermanent()
+        {
+            // Edge 403 (plain HTTP or a path outside the ingest API): stop
+            // sending, keep the batch, no retry until restart.
+            QueryRig.Init(Settings(true));
+            QueryRig.Flush();
+            Thread.Sleep(300);
+            int rowsBefore = HarnessRows();
+            Req("POST", "/__harness/mode", "{\"events\":\"edge-forbidden\"}");
+            int before = EventsRequestCount();
+            QueryRig.Track("edge_refused", null);
+            QueryRig.Flush();
+            Check(WaitUntil(() => EventsRequestCount() == before + 1, 5.0), "edge 403: the batch is attempted once");
+            Check(WaitUntil(() => !QueryRig.IsEnabled, 5.0), "edge 403: the SDK reports itself off");
+            Thread.Sleep(6000); // longer than the first retry backoff would be
+            QueryRig.Flush();
+            Thread.Sleep(500);
+            Check(EventsRequestCount() == before + 1, "edge 403: no retry, even after the backoff window");
+            Check(QueueFileCount() > 0, "edge 403: the refused batch is kept on disk");
+
+            // A restart with the corrected endpoint (same here) delivers it.
+            Req("POST", "/__harness/mode", "{\"events\":\"ok\"}");
+            QueryRig.Init(Settings(true));
+            for (int i = 0; i < 4; i++)
+            {
+                QueryRig.Flush();
+                Thread.Sleep(300);
+            }
+            Check(WaitUntil(() => HarnessRows() >= rowsBefore + 1, 10.0), "edge 403: kept events arrive after a restart");
+            var state = ReqObject("/__harness/state");
+            Check(state != null && (double)state["duplicates"] == 0, "edge 403: no duplicates after the restart");
+        }
+
+        private static void TestUnresolvableHostBacksOff()
+        {
+            // A DNS-blocked hostname is a network error: back off, keep, recover.
+            QueryRig.Init(Settings(true));
+            QueryRig.Flush();
+            Thread.Sleep(300);
+            int rowsBefore = HarnessRows();
+            int attemptsBefore = UnreachableAttempts();
+            Req("POST", "/__harness/mode", "{\"events\":\"unresolvable\"}");
+            QueryRig.Track("while_unreachable", null);
+            QueryRig.Flush();
+            Check(WaitUntil(() => UnreachableAttempts() > attemptsBefore, 5.0), "unreachable: the batch is attempted");
+            QueryRig.Flush();
+            QueryRig.Flush();
+            Thread.Sleep(1000);
+            Check(UnreachableAttempts() == attemptsBefore + 1, "unreachable: backoff holds further attempts");
+            Check((int)ClientField("_consecutiveFailures") >= 1 && QueueFileCount() > 0, "unreachable: counted as a failure, batch kept");
+            Check(QueryRig.IsEnabled, "unreachable: not treated as a permanent refusal");
+
+            Req("POST", "/__harness/mode", "{\"events\":\"ok\"}");
+            Thread.Sleep(7000); // ride out the first retry backoff (~5s + jitter)
+            QueryRig.Flush();
+            Check(WaitUntil(() => HarnessRows() >= rowsBefore + 1, 10.0), "unreachable: recovers by itself and delivers");
+        }
+
         private static void TestRemoteKillSwitch()
         {
             QueryRig.Init(Settings("remote"));
@@ -216,6 +283,47 @@ namespace QueryRigSdk
                 "hard-off: zero network calls of any kind");
         }
 
+        private static void TestBadEndpointIsInert()
+        {
+            // A key with no endpoint, or a non-HTTPS one off loopback, must be
+            // inert: no requests, no retries (spec §2.2).
+            foreach (string endpoint in new[] { "", "http://ingest.example.com/v1/events", "ingest.example.com/v1/events" })
+            {
+                QueryRig.Init(new QueryRigSettings { ApiKey = "test-key", Endpoint = endpoint, Enabled = true });
+                Req("POST", "/__harness/reset", "{}");
+                QueryRig.Track("never_sent", null);
+                QueryRig.Flush();
+                Thread.Sleep(500);
+                var state = ReqObject("/__harness/state");
+                Check((bool)ClientField("_inert") && state != null && (double)state["requests"] == 0,
+                    $"bad endpoint: inert with {(endpoint.Length == 0 ? "no endpoint" : endpoint)}");
+            }
+        }
+
+        private static void TestBlockedHostColdStart()
+        {
+            // Starting on a DNS-blocked hostname: the gate fetch fails, the
+            // default answer holds, and events queue on disk instead of being lost.
+            string blocked = Environment.GetEnvironmentVariable("QUERYRIG_TEST_UNRESOLVABLE_ENDPOINT");
+            if (string.IsNullOrEmpty(blocked))
+            {
+                blocked = "https://blocked.invalid/v1/events";
+            }
+            QueryRig.Init(new QueryRigSettings
+            {
+                ApiKey = "test-key", Endpoint = blocked, Enabled = "remote", FlushIntervalS = 999, GatePollIntervalS = 999,
+            });
+            QueryRig.Track("cold_start_blocked", null);
+            QueryRig.Flush();
+            Check(WaitUntil(() => QueueFileCount() > 0, 5.0), "blocked host: events queue on disk");
+            Thread.Sleep(1000);
+            Check(!(bool)ClientField("_inert") && QueryRig.IsEnabled, "blocked host: still enabled, waiting to retry");
+            Check(WaitUntil(() => (int)ClientField("_consecutiveFailures") >= 1, 10.0), "blocked host: the failure backs off");
+            string queueDir = (string)ClientField("_queueDir");
+            QueryRig.Shutdown();
+            Directory.Delete(Path.GetDirectoryName(queueDir), true);
+        }
+
         // ----------------------------------------------------------- helpers
 
         private static void Check(bool cond, string label)
@@ -249,6 +357,25 @@ namespace QueryRigSdk
         {
             var state = ReqObject("/__harness/state");
             return state != null ? (int)(double)state["rows"] : -1;
+        }
+
+        private static int UnreachableAttempts()
+        {
+            var state = ReqObject("/__harness/state");
+            return state != null ? (int)(double)state["unreachableAttempts"] : -1;
+        }
+
+        // The SDK's live client and its internals, for assertions only.
+        private static object ClientField(string name)
+        {
+            object client = typeof(QueryRig).GetField("_client", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+            return client.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance).GetValue(client);
+        }
+
+        private static int QueueFileCount()
+        {
+            string dir = (string)ClientField("_queueDir");
+            return Directory.Exists(dir) ? Directory.GetFiles(dir, "*.ndjson").Length : 0;
         }
 
         private static int EventsRequestCount()
