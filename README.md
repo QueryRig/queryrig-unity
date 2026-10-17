@@ -1,8 +1,7 @@
 # QueryRig SDK for Unity
 
-Game analytics for [QueryRig](https://github.com/prhym/queryrig): batched,
-durable event tracking with a runtime on/off switch. Implements the QueryRig
-engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
+Game analytics for [QueryRig](https://queryrig.com): batched, durable event
+tracking with a runtime on/off switch.
 
 - **Batched** — events queue in memory and flush every 5 s / 100 events, one
   HTTP request instead of dozens. `Track()` validates, stamps, and serializes
@@ -23,12 +22,12 @@ engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
    **Add package from git URL…**, and paste:
 
    ```
-   https://github.com/prhym/queryrig-unity.git
+   https://github.com/QueryRig/queryrig-unity.git
    ```
 3. Click **Add** and wait for Unity to finish importing.
 
 (Equivalent, if you'd rather edit the file directly: add
-`"com.queryrig.sdk": "https://github.com/prhym/queryrig-unity.git"` to
+`"com.queryrig.sdk": "https://github.com/QueryRig/queryrig-unity.git"` to
 `Packages/manifest.json`.)
 
 The SDK self-initializes at startup — no scene objects, no prefabs to drag
@@ -218,24 +217,16 @@ How the SDK reacts when it cannot deliver:
 - Platforms without a device id keep their random fallback id across key
   rotations: it now lives at `persistentDataPath/queryrig/device_id`.
 
-## Conformance test
+## Tests
 
 The package ships an editor-only conformance runner (never compiled into
-builds). Use a **disposable test project**: this runner clears its local QueryRig
-data. With the harness running (`npm run sdk-harness` in the queryrig repo) and
-the package installed in that test project:
-
-```
-Unity.exe -batchmode -nographics -projectPath <project> ^
-  -executeMethod QueryRigSdk.QueryRigConformance.Run -logFile -
-```
-
-Covers delivery + stamping (including the hashed player id), an outage (zero
-loss, zero duplicates after disk-queue replay), an edge 403 treated as
-permanent without losing the batch, an unresolvable host backed off as a
-network error (live and at cold start), inert startup with a missing or
-non-HTTPS endpoint, the remote kill switch both directions, and hard-off
-silence. Exit code 0 on pass, 2 if the harness is unreachable.
+builds), run before each release. It covers delivery and stamping (including
+the hashed player id), an outage (zero loss, zero duplicates after disk-queue
+replay), an edge 403 treated as permanent without losing the batch, an
+unresolvable host backed off as a network error (live and at cold start),
+inert startup with a missing or non-HTTPS endpoint, the remote kill switch in
+both directions, and hard-off silence. It runs against QueryRig's SDK test
+server, which is not public.
 
 Standalone runtime regressions (actual runtime sources with Unity API shims):
 `dotnet run --project Tests~/Regression.csproj`. This does not replace testing
